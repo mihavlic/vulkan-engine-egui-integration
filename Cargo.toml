@@ -1,0 +1,32 @@
+[package]
+name = "egui_winit_vulkano"
+version = "0.23.0"
+authors = ["hakolao <okkohakola@gmail.com>"]
+edition = "2018"
+description = "Egui immediate mode gui integration with winit and Vulkano"
+homepage = "https://github.com/hakolao/egui_winit_vulkano"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/hakolao/egui_winit_vulkano"
+categories = ["gui", "game-development"]
+keywords = ["gui", "imgui", "immediate", "portable", "gamedev"]
+
+[features]
+default = ["clipboard", "links"]
+links = ["egui-winit/links"]
+clipboard = ["egui-winit/clipboard"]
+
+[patch.'https://github.com/mihavlic/vulkan-engine']
+graph = { path = "../vulkan-engine" }
+
+[dependencies]
+pumice = {git = "https://github.com/mihavlic/vulkan-bindings.git", features = ["wrappers"]}
+pumice-vma = {git = "https://github.com/mihavlic/pumice-vma.git", features = ["VK_VERSION_1_1"]}
+graph = {git = "https://github.com/mihavlic/vulkan-engine.git"}
+
+ahash = "0.8.1"
+bytemuck = "1.12.2"
+egui = "0.20.1"
+egui-winit = "0.20.1"
+image = "0.24.4"
+winit = "0.27.5"
