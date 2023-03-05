@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use image::RgbaImage;
-use vulkano::{
+use pumice::{
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
         PrimaryCommandBufferAbstract,
@@ -29,10 +29,13 @@ pub fn immutable_texture_from_bytes(
     queue: Arc<Queue>,
     byte_data: &[u8],
     dimensions: [u32; 2],
-    format: vulkano::format::Format,
+    format: pumice::format::Format,
 ) -> Result<Arc<dyn ImageViewAbstract + Send + Sync + 'static>, ImmutableImageCreationError> {
-    let vko_dims =
-        ImageDimensions::Dim2d { width: dimensions[0], height: dimensions[1], array_layers: 1 };
+    let vko_dims = ImageDimensions::Dim2d {
+        width: dimensions[0],
+        height: dimensions[1],
+        array_layers: 1,
+    };
 
     let mut cbb = AutoCommandBufferBuilder::primary(
         &allocators.command_buffer,
@@ -56,7 +59,7 @@ pub fn immutable_texture_from_file(
     allocators: &Allocators,
     queue: Arc<Queue>,
     file_bytes: &[u8],
-    format: vulkano::format::Format,
+    format: pumice::format::Format,
 ) -> Result<Arc<dyn ImageViewAbstract + Send + Sync + 'static>, ImmutableImageCreationError> {
     use image::GenericImageView;
 
@@ -77,7 +80,13 @@ pub fn immutable_texture_from_file(
         new_rgba.to_vec()
     };
     let dimensions = img.dimensions();
-    immutable_texture_from_bytes(allocators, queue, &rgba, [dimensions.0, dimensions.1], format)
+    immutable_texture_from_bytes(
+        allocators,
+        queue,
+        &rgba,
+        [dimensions.0, dimensions.1],
+        format,
+    )
 }
 
 pub struct Allocators {

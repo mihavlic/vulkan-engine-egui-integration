@@ -7,7 +7,7 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
-use std::{convert::TryFrom, sync::Arc};
+use std::{convert::TryFrom, hash::BuildHasher, sync::Arc};
 
 use ahash::AHashMap;
 use bytemuck::{Pod, Zeroable};
@@ -15,224 +15,308 @@ use egui::{
     epaint::{Mesh, Primitive},
     ClippedPrimitive, PaintCallbackInfo, Rect, TexturesDelta,
 };
-use vulkano::{
-    buffer::{
-        cpu_pool::CpuBufferPoolChunk, BufferUsage, CpuAccessibleBuffer, CpuBufferPool,
-        TypedBufferAccess,
-    },
-    command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, BlitImageInfo,
-        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferToImageInfo, ImageBlit,
-        PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo,
-        SecondaryAutoCommandBuffer, SubpassContents,
-    },
-    descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, layout::DescriptorSetLayout,
-        PersistentDescriptorSet, WriteDescriptorSet,
-    },
-    device::Queue,
-    format::{Format, NumericType},
-    image::{
-        view::ImageView, ImageAccess, ImageLayout, ImageUsage, ImageViewAbstract, ImmutableImage,
-        SampleCount,
-    },
-    memory::allocator::{MemoryUsage, StandardMemoryAllocator},
-    pipeline::{
-        graphics::{
-            color_blend::{AttachmentBlend, BlendFactor, ColorBlendState},
-            input_assembly::InputAssemblyState,
-            multisample::MultisampleState,
-            rasterization::{CullMode as CullModeEnum, RasterizationState},
-            vertex_input::BuffersDefinition,
-            viewport::{Scissor, Viewport, ViewportState},
-        },
-        GraphicsPipeline, Pipeline, PipelineBindPoint,
-    },
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode},
-    sync::GpuFuture,
-    DeviceSize,
+use graph::{
+    device::{submission, Device},
+    object,
+    smallvec::smallvec,
+    storage::DefaultAhashRandomstate,
 };
+use pumice::vk;
+// use vk
+//     buffer::{
+//         cpu_pool::CpuBufferPoolChunk, BufferUsage, CpuAccessibleBuffer, CpuBufferPool,
+//         TypedBufferAccess,
+//     },
+//     command_buffer::{
+//         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, BlitImageInfo,
+//         CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferToImageInfo, ImageBlit,
+//         PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo,
+//         SecondaryAutoCommandBuffer, SubpassContents,
+//     },
+//     descriptor_set::{
+//         allocator::StandardDescriptorSetAllocator, layout::DescriptorSetLayout,
+//         PersistentDescriptorSet, WriteDescriptorSet,
+//     },
+//     device::Queue,
+//     format::{Format, NumericType},
+//     image::{
+//         view::ImageView, ImageAccess, ImageLayout, ImageUsage, ImageViewAbstract, ImmutableImage,
+//         SampleCount,
+//     },
+//     memory::allocator::{MemoryUsage, StandardMemoryAllocator},
+//     pipeline::{
+//         graphics::{
+//             color_blend::{AttachmentBlend, BlendFactor, ColorBlendState},
+//             input_assembly::InputAssemblyState,
+//             multisample::MultisampleState,
+//             rasterization::{CullMode as CullModeEnum, RasterizationState},
+//             vertex_input::BuffersDefinition,
+//             viewport::{Scissor, Viewport, ViewportState},
+//         },
+//         GraphicsPipeline, Pipeline, PipelineBindPoint,
+//     },
+//     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+//     sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode},
+//     sync::GpuFuture,
+//     u64,
+// };
 
 use crate::utils::Allocators;
 
-const VERTICES_PER_QUAD: DeviceSize = 4;
-const VERTEX_BUFFER_SIZE: DeviceSize = 1024 * 1024 * VERTICES_PER_QUAD;
-const INDEX_BUFFER_SIZE: DeviceSize = 1024 * 1024 * 2;
+use pumice_vma as vma;
+
+const VERTEX_BUFFER_SIZE: u64 = 1024 * 1024 * 4 * (std::mem::size_of::<EguiVertex>() as u64);
+const INDEX_BUFFER_SIZE: u64 = 1024 * 1024 * 2 * 4;
 
 /// Should match vertex definition of egui (except color is `[f32; 4]`)
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy, Zeroable, Pod)]
 pub struct EguiVertex {
     pub position: [f32; 2],
     pub tex_coords: [f32; 2],
     pub color: [f32; 4],
 }
-vulkano::impl_vertex!(EguiVertex, position, tex_coords, color);
+
+#[repr(C)]
+pub struct PushConstants {
+    screen_size: [f32; 2],
+    need_srgb_conv: i32,
+}
 
 pub struct Renderer {
-    gfx_queue: Arc<Queue>,
-    render_pass: Option<Arc<RenderPass>>,
+    gfx_queue: submission::Queue,
+    renderpass: Option<object::RenderPass>,
     is_overlay: bool,
     need_srgb_conv: bool,
 
     #[allow(unused)]
-    format: vulkano::format::Format,
-    sampler: Arc<Sampler>,
+    format: vk::Format,
+    sampler: object::Sampler,
 
     allocators: Allocators,
-    vertex_buffer_pool: CpuBufferPool<EguiVertex>,
-    index_buffer_pool: CpuBufferPool<u32>,
-    pipeline: Arc<GraphicsPipeline>,
-    subpass: Subpass,
+    vertex_buffer: object::Buffer,
+    index_buffer: object::Buffer,
+    pipeline: object::ConcreteGraphicsPipeline,
 
-    texture_desc_sets: AHashMap<egui::TextureId, Arc<PersistentDescriptorSet>>,
-    texture_images: AHashMap<egui::TextureId, Arc<dyn ImageViewAbstract + Send + Sync + 'static>>,
+    texture_desc_sets: AHashMap<egui::TextureId, vk::DescriptorSet>,
+    texture_images: AHashMap<egui::TextureId, vk::ImageView>,
     next_native_tex_id: u64,
 }
 
 impl Renderer {
-    pub fn new_with_subpass(
-        gfx_queue: Arc<Queue>,
-        final_output_format: Format,
-        subpass: Subpass,
-    ) -> Renderer {
-        let need_srgb_conv = final_output_format.type_color().unwrap() == NumericType::UNORM;
-        let allocators = Allocators::new_default(gfx_queue.device());
-        let (vertex_buffer_pool, index_buffer_pool) = Self::create_buffers(&allocators.memory);
-        let pipeline = Self::create_pipeline(gfx_queue.clone(), subpass.clone());
-        let sampler = Sampler::new(gfx_queue.device().clone(), SamplerCreateInfo {
-            mag_filter: Filter::Linear,
-            min_filter: Filter::Linear,
-            address_mode: [SamplerAddressMode::ClampToEdge; 3],
-            mipmap_mode: SamplerMipmapMode::Linear,
-            ..Default::default()
-        })
-        .unwrap();
-        Renderer {
-            gfx_queue,
-            format: final_output_format,
-            render_pass: None,
-            vertex_buffer_pool,
-            index_buffer_pool,
-            pipeline,
-            subpass,
-            texture_desc_sets: AHashMap::default(),
-            texture_images: AHashMap::default(),
-            next_native_tex_id: 0,
-            is_overlay: false,
-            need_srgb_conv,
-            sampler,
-            allocators,
-        }
-    }
+    // pub fn new_with_subpass(
+    //     gfx_queue: Arc<Queue>,
+    //     final_output_format: Format,
+    //     subpass: Subpass,
+    // ) -> Renderer {
+    //     let need_srgb_conv = final_output_format.type_color().unwrap() == NumericType::UNORM;
+    //     let allocators = Allocators::new_default(gfx_queue.device());
+    //     let (vertex_buffer_pool, index_buffer_pool) = Self::create_buffers(&allocators.memory);
+    //     let pipeline = Self::create_pipeline(gfx_queue.clone(), subpass.clone());
+    //     let sampler = Sampler::new(
+    //         gfx_queue.device().clone(),
+    //         SamplerCreateInfo {
+    //             mag_filter: Filter::Linear,
+    //             min_filter: Filter::Linear,
+    //             address_mode: [SamplerAddressMode::ClampToEdge; 3],
+    //             mipmap_mode: SamplerMipmapMode::Linear,
+    //             ..Default::default()
+    //         },
+    //     )
+    //     .unwrap();
+    //     Renderer {
+    //         gfx_queue,
+    //         format: final_output_format,
+    //         render_pass: None,
+    //         vertex_buffer_pool,
+    //         index_buffer_pool,
+    //         pipeline,
+    //         subpass,
+    //         texture_desc_sets: AHashMap::default(),
+    //         texture_images: AHashMap::default(),
+    //         next_native_tex_id: 0,
+    //         is_overlay: false,
+    //         need_srgb_conv,
+    //         sampler,
+    //         allocators,
+    //     }
+    // }
 
     /// Creates a new [Renderer] which is responsible for rendering egui with its own renderpass
     /// See examples
-    pub fn new_with_render_pass(
-        gfx_queue: Arc<Queue>,
-        final_output_format: Format,
+    pub unsafe fn new_with_render_pass(
+        gfx_queue: submission::Queue,
+        format_is_srgb: bool,
+        final_output_format: vk::Format,
         is_overlay: bool,
-        samples: SampleCount,
+        samples: vk::SampleCountFlags,
+
+        src_layout: vk::ImageLayout,
+        src_stages: vk::PipelineStageFlags,
+        src_access: vk::AccessFlags,
+
+        final_layout: vk::ImageLayout,
+
+        meta_device: &Device,
     ) -> Renderer {
-        // Create Gui render pass with just depth and final color
-        let render_pass = if is_overlay {
-            vulkano::single_pass_renderpass!(gfx_queue.device().clone(),
-                attachments: {
-                    final_color: {
-                        load: Load,
-                        store: Store,
-                        format: final_output_format,
-                        samples: samples,
-                    }
-                },
-                pass: {
-                        color: [final_color],
-                        depth_stencil: {}
-                }
-            )
-            .unwrap()
-        } else {
-            vulkano::single_pass_renderpass!(gfx_queue.device().clone(),
-                attachments: {
-                    final_color: {
-                        load: Clear,
-                        store: Store,
-                        format: final_output_format,
-                        samples: samples,
-                    }
-                },
-                pass: {
-                        color: [final_color],
-                        depth_stencil: {}
-                }
-            )
-            .unwrap()
+        let device = meta_device.device();
+        let callbacks = meta_device.allocator_callbacks();
+
+        let renderpass = {
+            let load_op = if is_overlay {
+                vk::AttachmentLoadOp::LOAD
+            } else {
+                vk::AttachmentLoadOp::CLEAR
+            };
+
+            let color = vk::AttachmentDescription {
+                format: final_output_format,
+                samples,
+                load_op,
+                store_op: vk::AttachmentStoreOp::STORE,
+                stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                initial_layout: src_layout,
+                final_layout,
+                ..Default::default()
+            };
+
+            let color_ref = vk::AttachmentReference {
+                attachment: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                layout: todo!(),
+            };
+
+            let subpass = vk::SubpassDescription {
+                pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
+                color_attachment_count: 1,
+                p_color_attachments: &color_ref,
+                ..Default::default()
+            };
+
+            let dependency = vk::SubpassDependency {
+                src_subpass: vk::SUBPASS_EXTERNAL,
+                dst_subpass: 0,
+                src_stage_mask: src_stages,
+                dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                src_access_mask: src_access,
+                dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                ..Default::default()
+            };
+
+            let render_pass_info = vk::RenderPassCreateInfo {
+                attachment_count: 1,
+                p_attachments: &color,
+                subpass_count: 1,
+                p_subpasses: &subpass,
+                dependency_count: 1,
+                p_dependencies: &dependency,
+                ..Default::default()
+            };
+
+            device
+                .create_render_pass(&render_pass_info, callbacks)
+                .unwrap()
         };
 
-        let need_srgb_conv = final_output_format.type_color().unwrap() == NumericType::UNORM;
-        let allocators = Allocators::new_default(gfx_queue.device());
-        let (vertex_buffer_pool, index_buffer_pool) = Self::create_buffers(&allocators.memory);
+        let need_srgb_conv = !format_is_srgb;
+        let vertex_buffer = Self::create_buffer(
+            VERTEX_BUFFER_SIZE,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            meta_device,
+        );
+        let index_buffer = Self::create_buffer(
+            INDEX_BUFFER_SIZE,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            meta_device,
+        );
 
-        let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
-        let pipeline = Self::create_pipeline(gfx_queue.clone(), subpass.clone());
-        let sampler = Sampler::new(gfx_queue.device().clone(), SamplerCreateInfo {
-            mag_filter: Filter::Linear,
-            min_filter: Filter::Linear,
-            address_mode: [SamplerAddressMode::ClampToEdge; 3],
-            mipmap_mode: SamplerMipmapMode::Linear,
-            ..Default::default()
-        })
-        .unwrap();
+        let pipeline = Self::create_pipeline(gfx_queue.clone(), todo!());
+
+        let sampler = {
+            let info = vk::SamplerCreateInfo {
+                mag_filter: vk::Filter::LINEAR,
+                min_filter: vk::Filter::LINEAR,
+                mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+                address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                ..Default::default()
+            };
+            device.create_sampler(&info, callbacks).unwrap()
+        };
+
         Renderer {
             gfx_queue,
             format: final_output_format,
-            render_pass: Some(render_pass),
-            vertex_buffer_pool,
-            index_buffer_pool,
+            renderpass: Some(renderpass),
+            vertex_buffer,
+            index_buffer,
             pipeline,
-            subpass,
-            texture_desc_sets: AHashMap::default(),
-            texture_images: AHashMap::default(),
+            texture_desc_sets: AHashMap::with_hasher((DefaultAhashRandomstate).build_hasher()),
+            texture_images: AHashMap::with_hasher((DefaultAhashRandomstate).build_hasher()),
+            allocators: Allocators::new_default(todo!()),
             next_native_tex_id: 0,
             is_overlay,
             need_srgb_conv,
             sampler,
-            allocators,
         }
     }
 
     pub fn has_renderpass(&self) -> bool {
-        self.render_pass.is_some()
+        self.renderpass.is_some()
     }
 
-    fn create_buffers(
-        allocator: &Arc<StandardMemoryAllocator>,
-    ) -> (CpuBufferPool<EguiVertex>, CpuBufferPool<u32>) {
-        // Create vertex and index buffers
-        let vertex_buffer_pool = CpuBufferPool::new(
-            allocator.clone(),
-            BufferUsage { vertex_buffer: true, ..BufferUsage::empty() },
-            MemoryUsage::Upload,
-        );
-        vertex_buffer_pool
-            .reserve(VERTEX_BUFFER_SIZE)
-            .expect("Failed to reserve vertex buffer memory");
-        let index_buffer_pool = CpuBufferPool::new(
-            allocator.clone(),
-            BufferUsage { index_buffer: true, ..BufferUsage::empty() },
-            MemoryUsage::Upload,
-        );
-        index_buffer_pool
-            .reserve(INDEX_BUFFER_SIZE)
-            .expect("Failed to reserve index buffer memory");
-
-        (vertex_buffer_pool, index_buffer_pool)
+    unsafe fn create_buffer(
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        device: &Device,
+    ) -> object::Buffer {
+        device
+            .create_buffer(
+                object::BufferCreateInfo {
+                    flags: vk::BufferCreateFlags::empty(),
+                    size,
+                    usage,
+                    sharing_mode_concurrent: false,
+                    label: None,
+                },
+                vma::AllocationCreateInfo {
+                    flags: vma::AllocationCreateFlags::empty(),
+                    usage: vma::MemoryUsage::AutoPreferDevice,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
     }
 
-    fn create_pipeline(gfx_queue: Arc<Queue>, subpass: Subpass) -> Arc<GraphicsPipeline> {
-        let vs = vs::load(gfx_queue.device().clone()).expect("failed to create shader module");
-        let fs = fs::load(gfx_queue.device().clone()).expect("failed to create shader module");
+    unsafe fn create_pipeline(sampler: object::Sampler, device: &Device) -> Arc<GraphicsPipeline> {
+        const VS_BYTES: &[u8] = include_bytes!("../shaders/vertex.spv");
+        const FS_BYTES: &[u8] = include_bytes!("../shaders/fragment.spv");
+
+        let mut vs_cursor = std::io::Cursor::new(VS_BYTES);
+        let mut fs_cursor = std::io::Cursor::new(VS_BYTES);
+
+        let vs = device.create_shader_module_read(&mut vs_cursor).unwrap();
+        let fs = device.create_shader_module_read(&mut fs_cursor).unwrap();
+
+        let set_layout =
+            device.create_descriptor_set_layout(object::DescriptorSetLayoutCreateInfo {
+                flags: vk::DescriptorSetLayoutCreateFlags::empty(),
+                bindings: vec![object::DescriptorBinding {
+                    binding: 0,
+                    count: 1,
+                    kind: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    stages: vk::ShaderStageFlags::FRAGMENT,
+                    immutable_samplers: smallvec![sampler],
+                }],
+            });
+
+        let layout = device.create_pipeline_layout(object::PipelineLayoutCreateInfo {
+            set_layouts: vec![set_layout],
+            push_constants: vec![vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                offset: 0,
+                size: std::mem::size_of::<PushConstants>(),
+            }],
+        });
 
         let mut blend = AttachmentBlend::alpha();
         blend.color_source = BlendFactor::One;
@@ -263,9 +347,15 @@ impl Renderer {
         layout: &Arc<DescriptorSetLayout>,
         image: Arc<dyn ImageViewAbstract + 'static>,
     ) -> Arc<PersistentDescriptorSet> {
-        PersistentDescriptorSet::new(&self.allocators.descriptor_set, layout.clone(), [
-            WriteDescriptorSet::image_view_sampler(0, image, self.sampler.clone()),
-        ])
+        PersistentDescriptorSet::new(
+            &self.allocators.descriptor_set,
+            layout.clone(),
+            [WriteDescriptorSet::image_view_sampler(
+                0,
+                image,
+                self.sampler.clone(),
+            )],
+        )
         .unwrap()
     }
 
@@ -298,16 +388,24 @@ impl Renderer {
                     image.pixels.len(),
                     "Mismatch between texture size and texel count"
                 );
-                image.pixels.iter().flat_map(|color| color.to_array()).collect()
+                image
+                    .pixels
+                    .iter()
+                    .flat_map(|color| color.to_array())
+                    .collect()
             }
-            egui::ImageData::Font(image) => {
-                image.srgba_pixels(None).flat_map(|color| color.to_array()).collect()
-            }
+            egui::ImageData::Font(image) => image
+                .srgba_pixels(None)
+                .flat_map(|color| color.to_array())
+                .collect(),
         };
         // Create buffer to be copied to the image
         let texture_data_buffer = CpuAccessibleBuffer::from_iter(
             &self.allocators.memory,
-            BufferUsage { transfer_src: true, ..BufferUsage::empty() },
+            BufferUsage {
+                transfer_src: true,
+                ..BufferUsage::empty()
+            },
             false,
             data,
         )
@@ -315,13 +413,13 @@ impl Renderer {
         // Create image
         let (img, init) = ImmutableImage::uninitialized(
             &self.allocators.memory,
-            vulkano::image::ImageDimensions::Dim2d {
+            vk::ImageDimensions::Dim2d {
                 width: delta.image.width() as u32,
                 height: delta.image.height() as u32,
                 array_layers: 1,
             },
             Format::R8G8B8A8_SRGB,
-            vulkano::image::MipmapsCount::One,
+            vk::MipmapsCount::One,
             ImageUsage {
                 transfer_dst: true,
                 transfer_src: true,
@@ -344,16 +442,22 @@ impl Renderer {
         .unwrap();
 
         // Copy buffer to image
-        cbb.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(texture_data_buffer, init))
-            .unwrap();
+        cbb.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+            texture_data_buffer,
+            init,
+        ))
+        .unwrap();
 
         // Blit texture data to existing image if delta pos exists (e.g. font changed)
         if let Some(pos) = delta.pos {
             if let Some(existing_image) = self.texture_images.get(&texture_id) {
                 let src_dims = font_image.image().dimensions();
                 let top_left = [pos[0] as u32, pos[1] as u32, 0];
-                let bottom_right =
-                    [pos[0] as u32 + src_dims.width(), pos[1] as u32 + src_dims.height(), 1];
+                let bottom_right = [
+                    pos[0] as u32 + src_dims.width(),
+                    pos[1] as u32 + src_dims.height(),
+                    1,
+                ];
 
                 cbb.blit_image(BlitImageInfo {
                     src_image_layout: ImageLayout::General,
@@ -391,27 +495,39 @@ impl Renderer {
         rect: Rect,
     ) -> Scissor {
         let min = rect.min;
-        let min = egui::Pos2 { x: min.x * scale_factor, y: min.y * scale_factor };
+        let min = egui::Pos2 {
+            x: min.x * scale_factor,
+            y: min.y * scale_factor,
+        };
         let min = egui::Pos2 {
             x: min.x.clamp(0.0, framebuffer_dimensions[0] as f32),
             y: min.y.clamp(0.0, framebuffer_dimensions[1] as f32),
         };
         let max = rect.max;
-        let max = egui::Pos2 { x: max.x * scale_factor, y: max.y * scale_factor };
+        let max = egui::Pos2 {
+            x: max.x * scale_factor,
+            y: max.y * scale_factor,
+        };
         let max = egui::Pos2 {
             x: max.x.clamp(min.x, framebuffer_dimensions[0] as f32),
             y: max.y.clamp(min.y, framebuffer_dimensions[1] as f32),
         };
         Scissor {
             origin: [min.x.round() as u32, min.y.round() as u32],
-            dimensions: [(max.x.round() - min.x) as u32, (max.y.round() - min.y) as u32],
+            dimensions: [
+                (max.x.round() - min.x) as u32,
+                (max.y.round() - min.y) as u32,
+            ],
         }
     }
 
     fn create_subbuffers(
         &self,
         mesh: &Mesh,
-    ) -> (Arc<CpuBufferPoolChunk<EguiVertex>>, Arc<CpuBufferPoolChunk<u32>>) {
+    ) -> (
+        Arc<CpuBufferPoolChunk<EguiVertex>>,
+        Arc<CpuBufferPoolChunk<u32>>,
+    ) {
         // Copy vertices to buffer
         let v_slice = &mesh.vertices;
 
@@ -460,14 +576,17 @@ impl Renderer {
         let img_dims = final_image.image().dimensions().width_height();
         // Create framebuffer (must be in same order as render pass description in `new`
         let framebuffer = Framebuffer::new(
-            self.render_pass
+            self.renderpass
                 .as_ref()
                 .expect(
                     "No renderpass on this renderer (created with subpass), use 'draw_subpass' \
                      instead",
                 )
                 .clone(),
-            FramebufferCreateInfo { attachments: vec![final_image], ..Default::default() },
+            FramebufferCreateInfo {
+                attachments: vec![final_image],
+                ..Default::default()
+            },
         )
         .unwrap();
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
@@ -480,7 +599,11 @@ impl Renderer {
         command_buffer_builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![if !self.is_overlay { Some([0.0; 4].into()) } else { None }],
+                    clear_values: vec![if !self.is_overlay {
+                        Some([0.0; 4].into())
+                    } else {
+                        None
+                    }],
                     ..RenderPassBeginInfo::framebuffer(framebuffer)
                 },
                 SubpassContents::SecondaryCommandBuffers,
@@ -507,10 +630,17 @@ impl Renderer {
 
         let (mut command_buffer_builder, framebuffer_dimensions) = self.start(final_image);
         let mut builder = self.create_secondary_command_buffer_builder();
-        self.draw_egui(scale_factor, clipped_meshes, framebuffer_dimensions, &mut builder);
+        self.draw_egui(
+            scale_factor,
+            clipped_meshes,
+            framebuffer_dimensions,
+            &mut builder,
+        );
         // Execute draw commands
         let command_buffer = builder.build().unwrap();
-        command_buffer_builder.execute_commands(command_buffer).unwrap();
+        command_buffer_builder
+            .execute_commands(command_buffer)
+            .unwrap();
         let done_future = self.finish(command_buffer_builder, Box::new(before_future));
 
         for &id in &textures_delta.free {
@@ -530,10 +660,12 @@ impl Renderer {
         command_buffer_builder.end_render_pass().unwrap();
         // Then execute our whole command buffer
         let command_buffer = command_buffer_builder.build().unwrap();
-        let after_main_cb =
-            before_main_cb_future.then_execute(self.gfx_queue.clone(), command_buffer).unwrap();
-        let future =
-            after_main_cb.then_signal_fence_and_flush().expect("Failed to signal fence and flush");
+        let after_main_cb = before_main_cb_future
+            .then_execute(self.gfx_queue.clone(), command_buffer)
+            .unwrap();
+        let future = after_main_cb
+            .then_signal_fence_and_flush()
+            .expect("Failed to signal fence and flush");
         // Return our future
         Box::new(future)
     }
@@ -549,7 +681,12 @@ impl Renderer {
             self.update_texture(*id, image_delta);
         }
         let mut builder = self.create_secondary_command_buffer_builder();
-        self.draw_egui(scale_factor, clipped_meshes, framebuffer_dimensions, &mut builder);
+        self.draw_egui(
+            scale_factor,
+            clipped_meshes,
+            framebuffer_dimensions,
+            &mut builder,
+        );
         let buffer = builder.build().unwrap();
         for &id in &textures_delta.free {
             self.unregister_image(id);
@@ -572,7 +709,11 @@ impl Renderer {
             need_srgb_conv: self.need_srgb_conv.into(),
         };
 
-        for ClippedPrimitive { clip_rect, primitive } in clipped_meshes {
+        for ClippedPrimitive {
+            clip_rect,
+            primitive,
+        } in clipped_meshes
+        {
             match primitive {
                 Primitive::Mesh(mesh) => {
                     // Nothing to draw if we don't have vertices & indices
@@ -592,17 +733,24 @@ impl Renderer {
 
                     let (vertices, indices) = self.create_subbuffers(mesh);
 
-                    let desc_set = self.texture_desc_sets.get(&mesh.texture_id).unwrap().clone();
+                    let desc_set = self
+                        .texture_desc_sets
+                        .get(&mesh.texture_id)
+                        .unwrap()
+                        .clone();
                     builder
                         .bind_pipeline_graphics(self.pipeline.clone())
-                        .set_viewport(0, vec![Viewport {
-                            origin: [0.0, 0.0],
-                            dimensions: [
-                                framebuffer_dimensions[0] as f32,
-                                framebuffer_dimensions[1] as f32,
-                            ],
-                            depth_range: 0.0..1.0,
-                        }])
+                        .set_viewport(
+                            0,
+                            vec![Viewport {
+                                origin: [0.0, 0.0],
+                                dimensions: [
+                                    framebuffer_dimensions[0] as f32,
+                                    framebuffer_dimensions[1] as f32,
+                                ],
+                                depth_range: 0.0..1.0,
+                            }],
+                        )
                         .set_scissor(0, scissors)
                         .bind_descriptor_sets(
                             PipelineBindPoint::Graphics,
@@ -635,11 +783,14 @@ impl Renderer {
                         )];
 
                         builder
-                            .set_viewport(0, vec![Viewport {
-                                origin: [rect_min_x, rect_min_y],
-                                dimensions: [rect_max_x - rect_min_x, rect_max_y - rect_min_y],
-                                depth_range: 0.0..1.0,
-                            }])
+                            .set_viewport(
+                                0,
+                                vec![Viewport {
+                                    origin: [rect_min_x, rect_min_y],
+                                    dimensions: [rect_max_x - rect_min_x, rect_max_y - rect_min_y],
+                                    depth_range: 0.0..1.0,
+                                }],
+                            )
                             .set_scissor(0, scissors);
 
                         let info = egui::PaintCallbackInfo {
@@ -650,14 +801,17 @@ impl Renderer {
                         };
 
                         if let Some(callback) = callback.callback.downcast_ref::<CallbackFn>() {
-                            (callback.f)(info, &mut CallbackContext {
-                                builder,
-                                resources: self.render_resources(),
-                            });
+                            (callback.f)(
+                                info,
+                                &mut CallbackContext {
+                                    builder,
+                                    resources: self.render_resources(),
+                                },
+                            );
                         } else {
                             println!(
                                 "Warning: Unsupported render callback. Expected \
-                                 egui_winit_vulkano::CallbackFn"
+                                 egui_winit_vk"
                             );
                         }
                     }
@@ -715,7 +869,7 @@ pub struct RenderResources<'a> {
 pub type CallbackFnDef = dyn Fn(PaintCallbackInfo, &mut CallbackContext) + Sync + Send;
 
 /// A callback function that can be used to compose an [`epaint::PaintCallback`] for
-/// custom rendering with [`vulkano`].
+/// custom rendering with [`pumice`].
 ///
 /// The callback is passed an [`egui::PaintCallbackInfo`] and a [`CallbackContext`] which
 /// can be used to construct Vulkano graphics pipelines and buffers.
@@ -736,7 +890,7 @@ impl CallbackFn {
 }
 
 mod vs {
-    vulkano_shaders::shader! {
+    pumice_shaders::shader! {
         ty: "vertex",
         src: "
 #version 450
@@ -783,7 +937,7 @@ void main() {
 
 // Similar to https://github.com/ArjunNair/egui_sdl2_gl/blob/main/src/painter.rs
 mod fs {
-    vulkano_shaders::shader! {
+    pumice_shaders::shader! {
         ty: "fragment",
         src: "
 #version 450

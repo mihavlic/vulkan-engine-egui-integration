@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use egui::{ClippedPrimitive, TexturesDelta};
 use egui_winit::winit::event_loop::EventLoopWindowTarget;
-use vulkano::{
+use pumice::{
     command_buffer::SecondaryAutoCommandBuffer,
     device::Queue,
     format::{Format, NumericType},
@@ -30,7 +30,7 @@ fn get_surface_image_format(
     surface: &Arc<Surface>,
     preferred_format: Option<Format>,
     gfx_queue: &Arc<Queue>,
-) -> vulkano::format::Format {
+) -> pumice::format::Format {
     preferred_format.unwrap_or_else(|| {
         gfx_queue
             .device()
@@ -75,7 +75,7 @@ pub struct Gui {
 
 impl Gui {
     /// Creates new Egui to Vulkano integration by setting the necessary parameters
-    /// This is to be called once we have access to vulkano_win's winit window surface
+    /// This is to be called once we have access to pumice_win's winit window surface
     /// and gfx queue. Created with this, the renderer will own a render pass which is useful to e.g. place your render pass' images
     /// onto egui windows
     pub fn new<T>(
@@ -246,11 +246,11 @@ impl Gui {
 
     /// Registers a user image to be used by egui
     /// - `image_file_bytes`: e.g. include_bytes!("./assets/tree.png")
-    /// - `format`: e.g. vulkano::format::Format::R8G8B8A8Unorm
+    /// - `format`: e.g. pumice::format::Format::R8G8B8A8Unorm
     pub fn register_user_image(
         &mut self,
         image_file_bytes: &[u8],
-        format: vulkano::format::Format,
+        format: pumice::format::Format,
     ) -> egui::TextureId {
         let image = immutable_texture_from_file(
             self.renderer.allocators(),
@@ -266,7 +266,7 @@ impl Gui {
         &mut self,
         image_byte_data: &[u8],
         dimensions: [u32; 2],
-        format: vulkano::format::Format,
+        format: pumice::format::Format,
     ) -> egui::TextureId {
         let image = immutable_texture_from_bytes(
             self.renderer.allocators(),
