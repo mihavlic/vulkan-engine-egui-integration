@@ -18,8 +18,9 @@ use egui::{
 use graph::{
     device::{submission, Device},
     object,
-    smallvec::smallvec,
+    smallvec::{smallvec, SmallVec},
     storage::DefaultAhashRandomstate,
+    util::ffi_ptr::AsFFiPtr,
 };
 use pumice::vk;
 // use vk
@@ -104,9 +105,9 @@ pub struct Renderer {
 
 impl Renderer {
     // pub fn new_with_subpass(
-    //     gfx_queue: Arc<Queue>,
-    //     final_output_format: Format,
-    //     subpass: Subpass,
+    //     gfx_queue : Arc<Queue>,
+    //     final_output_format : Format,
+    //     subpass : Subpass,
     // ) -> Renderer {
     //     let need_srgb_conv = final_output_format.type_color().unwrap() == NumericType::UNORM;
     //     let allocators = Allocators::new_default(gfx_queue.device());
@@ -115,26 +116,26 @@ impl Renderer {
     //     let sampler = Sampler::new(
     //         gfx_queue.device().clone(),
     //         SamplerCreateInfo {
-    //             mag_filter: Filter::Linear,
-    //             min_filter: Filter::Linear,
-    //             address_mode: [SamplerAddressMode::ClampToEdge; 3],
-    //             mipmap_mode: SamplerMipmapMode::Linear,
+    //             mag_filter : Filter::Linear,
+    //             min_filter : Filter::Linear,
+    //             address_mode : [SamplerAddressMode::ClampToEdge; 3],
+    //             mipmap_mode : SamplerMipmapMode::Linear,
     //             ..Default::default()
     //         },
     //     )
     //     .unwrap();
     //     Renderer {
     //         gfx_queue,
-    //         format: final_output_format,
-    //         render_pass: None,
+    //         format : final_output_format,
+    //         render_pass : None,
     //         vertex_buffer_pool,
     //         index_buffer_pool,
     //         pipeline,
     //         subpass,
-    //         texture_desc_sets: AHashMap::default(),
-    //         texture_images: AHashMap::default(),
-    //         next_native_tex_id: 0,
-    //         is_overlay: false,
+    //         texture_desc_sets : AHashMap::default(),
+    //         texture_images : AHashMap::default(),
+    //         next_native_tex_id : 0,
+    //         is_overlay : false,
     //         need_srgb_conv,
     //         sampler,
     //         allocators,
@@ -146,75 +147,257 @@ impl Renderer {
     pub unsafe fn new_with_render_pass(
         gfx_queue: submission::Queue,
         format_is_srgb: bool,
-        final_output_format: vk::Format,
-        is_overlay: bool,
+        format: vk::Format,
+
         samples: vk::SampleCountFlags,
 
-        src_layout: vk::ImageLayout,
-        src_stages: vk::PipelineStageFlags,
-        src_access: vk::AccessFlags,
+        color_load_op: vk::AttachmentLoadOp,
+        color_store_op: vk::AttachmentStoreOp,
 
-        final_layout: vk::ImageLayout,
+        color_src_layout: vk::ImageLayout,
+        color_src_stages: vk::PipelineStageFlags,
+        color_src_access: vk::AccessFlags,
+        color_final_layout: vk::ImageLayout,
+
+        resolve_enable: bool,
+
+        resolve_load_op: vk::AttachmentLoadOp,
+        resolve_store_op: vk::AttachmentStoreOp,
+
+        resolve_src_layout: vk::ImageLayout,
+        resolve_src_stages: vk::PipelineStageFlags,
+        resolve_src_access: vk::AccessFlags,
+        resolve_final_layout: vk::ImageLayout,
 
         meta_device: &Device,
     ) -> Renderer {
+        if resolve_enable {
+            assert!(samples != vk::SampleCountFlags::C1);
+        }
+
         let device = meta_device.device();
         let callbacks = meta_device.allocator_callbacks();
 
-        let renderpass = {
-            let load_op = if is_overlay {
-                vk::AttachmentLoadOp::LOAD
-            } else {
-                vk::AttachmentLoadOp::CLEAR
-            };
+        let render_pass = {
+            let mut attachments = SmallVec::<[_; 2]>::new();
+            let mut dependencies = SmallVec::<[_; 2]>::new();
 
-            let color = vk::AttachmentDescription {
-                format: final_output_format,
+            // color
+            attachments.push(vk::AttachmentDescription {
+                format,
                 samples,
-                load_op,
-                store_op: vk::AttachmentStoreOp::STORE,
+                load_op: color_load_op,
+                store_op: color_store_op,
                 stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
                 stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-                initial_layout: src_layout,
-                final_layout,
+                initial_layout: color_src_layout,
+                final_layout: color_final_layout,
                 ..Default::default()
-            };
+            });
+            dependencies.push(vk::SubpassDependency {
+                src_subpass: vk::SUBPASS_EXTERNAL,
+                dst_subpass: 0,
+                src_stage_mask: color_src_stages,
+                dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                src_access_mask: color_src_access,
+                dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                ..Default::default()
+            });
 
             let color_ref = vk::AttachmentReference {
-                attachment: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                layout: todo!(),
+                attachment: 0,
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             };
+
+            let mut resolve_ref = None;
+            if resolve_enable {
+                resolve_ref = Some(vk::AttachmentReference {
+                    attachment: 1,
+                    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                });
+                attachments.push(vk::AttachmentDescription {
+                    format,
+                    samples: vk::SampleCountFlags::C1,
+                    load_op: resolve_load_op,
+                    store_op: resolve_store_op,
+                    stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+                    stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: resolve_src_layout,
+                    final_layout: resolve_final_layout,
+                    ..Default::default()
+                });
+                dependencies.push(vk::SubpassDependency {
+                    src_subpass: vk::SUBPASS_EXTERNAL,
+                    dst_subpass: 0,
+                    src_stage_mask: resolve_src_stages,
+                    dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    src_access_mask: resolve_src_access,
+                    dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    ..Default::default()
+                });
+            }
 
             let subpass = vk::SubpassDescription {
                 pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
                 color_attachment_count: 1,
                 p_color_attachments: &color_ref,
-                ..Default::default()
-            };
-
-            let dependency = vk::SubpassDependency {
-                src_subpass: vk::SUBPASS_EXTERNAL,
-                dst_subpass: 0,
-                src_stage_mask: src_stages,
-                dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                src_access_mask: src_access,
-                dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                p_resolve_attachments: resolve_ref.as_ffi_ptr(),
                 ..Default::default()
             };
 
             let render_pass_info = vk::RenderPassCreateInfo {
-                attachment_count: 1,
-                p_attachments: &color,
+                attachment_count: attachments.len() as u32,
+                p_attachments: attachments.as_ptr(),
                 subpass_count: 1,
                 p_subpasses: &subpass,
-                dependency_count: 1,
-                p_dependencies: &dependency,
+                dependency_count: dependencies.len() as u32,
+                p_dependencies: dependencies.as_ptr(),
                 ..Default::default()
             };
 
             device
                 .create_render_pass(&render_pass_info, callbacks)
                 .unwrap()
+        };
+
+        let pipeline = {
+            const VS_BYTES: &[u8] = include_bytes!("../shaders/vertex.spv");
+            const FS_BYTES: &[u8] = include_bytes!("../shaders/fragment.spv");
+
+            let mut vs_cursor = std::io::Cursor::new(VS_BYTES);
+            let mut fs_cursor = std::io::Cursor::new(VS_BYTES);
+
+            let vs = meta_device
+                .create_shader_module_read(&mut vs_cursor)
+                .unwrap();
+            let fs = meta_device
+                .create_shader_module_read(&mut fs_cursor)
+                .unwrap();
+
+            let sampler = meta_device
+                .create_descriptor_sampler(object::SamplerCreateInfo {
+                    mag_filter: vk::Filter::LINEAR,
+                    min_filter: vk::Filter::LINEAR,
+                    mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+                    address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                    address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let set_layout = meta_device
+                .create_descriptor_set_layout(object::DescriptorSetLayoutCreateInfo {
+                    flags: vk::DescriptorSetLayoutCreateFlags::empty(),
+                    bindings: vec![object::DescriptorBinding {
+                        binding: 0,
+                        count: 1,
+                        kind: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        stages: vk::ShaderStageFlags::FRAGMENT,
+                        immutable_samplers: smallvec![sampler],
+                    }],
+                })
+                .unwrap();
+
+            let layout = meta_device
+                .create_pipeline_layout(object::PipelineLayoutCreateInfo {
+                    set_layouts: vec![set_layout],
+                    push_constants: vec![vk::PushConstantRange {
+                        stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        offset: 0,
+                        size: std::mem::size_of::<PushConstants>(),
+                    }],
+                })
+                .unwrap();
+
+            let info = object::GraphicsPipelineCreateInfo::builder()
+                .stages([
+                    object::PipelineStage {
+                        flags: vk::PipelineShaderStageCreateFlags::empty(),
+                        stage: vk::ShaderStageFlags::VERTEX,
+                        module: vs,
+                        name: "main".into(),
+                        specialization_info: None,
+                    },
+                    object::PipelineStage {
+                        flags: vk::PipelineShaderStageCreateFlags::empty(),
+                        stage: vk::ShaderStageFlags::FRAGMENT,
+                        module: fs,
+                        name: "main".into(),
+                        specialization_info: None,
+                    },
+                ])
+                .input_assembly(object::state::InputAssembly {
+                    topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                    primitive_restart_enable: false,
+                })
+                .viewport(object::state::Viewport {
+                    // the actual contents are ignored, it is just important to have one for each
+                    viewports: smallvec![Default::default()],
+                    scissors: smallvec![Default::default()],
+                })
+                .vertex_input(object::state::VertexInput {
+                    vertex_bindings: [object::state::InputBinding {
+                        binding: 0,
+                        // 3 floats for position
+                        stride: std::mem::size_of::<EguiVertex>(),
+                        input_rate: vk::VertexInputRate::VERTEX,
+                    }]
+                    .to_vec(),
+                    vertex_attributes: [
+                        object::state::InputAttribute {
+                            location: 0,
+                            binding: 0,
+                            format: vk::Format::R32G32_SFLOAT,
+                            offset: 0,
+                        },
+                        object::state::InputAttribute {
+                            location: 0,
+                            binding: 1,
+                            format: vk::Format::R32G32_SFLOAT,
+                            offset: 8,
+                        },
+                        object::state::InputAttribute {
+                            location: 0,
+                            binding: 2,
+                            format: vk::Format::R8G8B8A8_UNORM,
+                            offset: 16,
+                        },
+                    ]
+                    .to_vec(),
+                })
+                .rasterization(object::state::Rasterization {
+                    depth_clamp_enable: false,
+                    rasterizer_discard_enable: false,
+                    polygon_mode: vk::PolygonMode::FILL,
+                    cull_mode: vk::CullModeFlags::NONE,
+                    front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+                    line_width: 1.0,
+                    ..Default::default()
+                })
+                .multisample(object::state::Multisample {
+                    rasterization_samples: samples,
+                    sample_shading_enable: false,
+                    ..Default::default()
+                })
+                .depth_stencil(object::state::DepthStencil::default())
+                .color_blend(object::state::ColorBlend {
+                    attachments: vec![object::state::Attachment {
+                        color_write_mask: vk::ColorComponentFlags::all(),
+                        src_color_blend_factor: vk::BlendFactor::ONE,
+                        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .dynamic_state([vk::DynamicState::SCISSOR, vk::DynamicState::VIEWPORT])
+                .render_pass(object::RenderPassMode::Normal {
+                    subpass: 0,
+                    render_pass,
+                })
+                .layout(layout.clone())
+                .finish();
+
+            meta_device.create_graphics_pipeline(info).unwrap()
         };
 
         let need_srgb_conv = !format_is_srgb;
@@ -229,23 +412,9 @@ impl Renderer {
             meta_device,
         );
 
-        let pipeline = Self::create_pipeline(gfx_queue.clone(), todo!());
-
-        let sampler = {
-            let info = vk::SamplerCreateInfo {
-                mag_filter: vk::Filter::LINEAR,
-                min_filter: vk::Filter::LINEAR,
-                mipmap_mode: vk::SamplerMipmapMode::LINEAR,
-                address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                ..Default::default()
-            };
-            device.create_sampler(&info, callbacks).unwrap()
-        };
-
         Renderer {
             gfx_queue,
-            format: final_output_format,
+            format,
             renderpass: Some(renderpass),
             vertex_buffer,
             index_buffer,
@@ -286,61 +455,6 @@ impl Renderer {
             )
             .unwrap()
     }
-
-    unsafe fn create_pipeline(sampler: object::Sampler, device: &Device) -> Arc<GraphicsPipeline> {
-        const VS_BYTES: &[u8] = include_bytes!("../shaders/vertex.spv");
-        const FS_BYTES: &[u8] = include_bytes!("../shaders/fragment.spv");
-
-        let mut vs_cursor = std::io::Cursor::new(VS_BYTES);
-        let mut fs_cursor = std::io::Cursor::new(VS_BYTES);
-
-        let vs = device.create_shader_module_read(&mut vs_cursor).unwrap();
-        let fs = device.create_shader_module_read(&mut fs_cursor).unwrap();
-
-        let set_layout =
-            device.create_descriptor_set_layout(object::DescriptorSetLayoutCreateInfo {
-                flags: vk::DescriptorSetLayoutCreateFlags::empty(),
-                bindings: vec![object::DescriptorBinding {
-                    binding: 0,
-                    count: 1,
-                    kind: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    stages: vk::ShaderStageFlags::FRAGMENT,
-                    immutable_samplers: smallvec![sampler],
-                }],
-            });
-
-        let layout = device.create_pipeline_layout(object::PipelineLayoutCreateInfo {
-            set_layouts: vec![set_layout],
-            push_constants: vec![vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                offset: 0,
-                size: std::mem::size_of::<PushConstants>(),
-            }],
-        });
-
-        let mut blend = AttachmentBlend::alpha();
-        blend.color_source = BlendFactor::One;
-        blend.alpha_source = BlendFactor::OneMinusDstAlpha;
-        blend.alpha_destination = BlendFactor::One;
-        let blend_state = ColorBlendState::new(1).blend(blend);
-
-        GraphicsPipeline::start()
-            .vertex_input_state(BuffersDefinition::new().vertex::<EguiVertex>())
-            .vertex_shader(vs.entry_point("main").unwrap(), ())
-            .input_assembly_state(InputAssemblyState::new())
-            .fragment_shader(fs.entry_point("main").unwrap(), ())
-            .viewport_state(ViewportState::viewport_dynamic_scissor_dynamic(1))
-            .color_blend_state(blend_state)
-            .rasterization_state(RasterizationState::new().cull_mode(CullModeEnum::None))
-            .multisample_state(MultisampleState {
-                rasterization_samples: subpass.num_samples().unwrap_or(SampleCount::Sample1),
-                ..Default::default()
-            })
-            .render_pass(subpass)
-            .build(gfx_queue.device().clone())
-            .unwrap()
-    }
-
     /// Creates a descriptor set for images
     fn sampled_image_desc_set(
         &self,
@@ -810,7 +924,7 @@ impl Renderer {
                             );
                         } else {
                             println!(
-                                "Warning: Unsupported render callback. Expected \
+                                "Warning : Unsupported render callback. Expected \
                                  egui_winit_vk"
                             );
                         }
@@ -886,107 +1000,5 @@ impl CallbackFn {
     ) -> Self {
         let f = Box::new(callback);
         CallbackFn { f }
-    }
-}
-
-mod vs {
-    pumice_shaders::shader! {
-        ty: "vertex",
-        src: "
-#version 450
-
-layout(location = 0) in vec2 position;
-layout(location = 1) in vec2 tex_coords;
-layout(location = 2) in vec4 color;
-
-layout(location = 0) out vec4 v_color;
-layout(location = 1) out vec2 v_tex_coords;
-
-layout(push_constant) uniform PushConstants {
-    vec2 screen_size;
-    int need_srgb_conv;
-} push_constants;
-
-// 0-1 linear  from  0-255 sRGB
-vec3 linear_from_srgb(vec3 srgb) {
-    bvec3 cutoff = lessThan(srgb, vec3(10.31475));
-    vec3 lower = srgb / vec3(3294.6);
-    vec3 higher = pow((srgb + vec3(14.025)) / vec3(269.025), vec3(2.4));
-    return mix(higher, lower, cutoff);
-}
-
-vec4 linear_from_srgba(vec4 srgba) {
-    return vec4(linear_from_srgb(srgba.rgb * 255.0), srgba.a);
-}
-
-void main() {
-  gl_Position =
-      vec4(2.0 * position.x / push_constants.screen_size.x - 1.0,
-           2.0 * position.y / push_constants.screen_size.y - 1.0, 0.0, 1.0);
-  // We must convert vertex color to linear
-  v_color = linear_from_srgba(color);
-  v_tex_coords = tex_coords;
-}",
-            types_meta: {
-                use bytemuck::{Pod, Zeroable};
-
-                #[derive(Clone, Copy, Zeroable, Pod)]
-            },
-    }
-}
-
-// Similar to https://github.com/ArjunNair/egui_sdl2_gl/blob/main/src/painter.rs
-mod fs {
-    pumice_shaders::shader! {
-        ty: "fragment",
-        src: "
-#version 450
-
-layout(location = 0) in vec4 v_color;
-layout(location = 1) in vec2 v_tex_coords;
-
-layout(location = 0) out vec4 f_color;
-
-layout(binding = 0, set = 0) uniform sampler2D font_texture;
-
-layout(push_constant) uniform PushConstants {
-    vec2 screen_size;
-    int need_srgb_conv;
-} push_constants;
-
-// 0-255 sRGB  from  0-1 linear
-vec3 srgb_from_linear(vec3 rgb) {
-  bvec3 cutoff = lessThan(rgb, vec3(0.0031308));
-  vec3 lower = rgb * vec3(3294.6);
-  vec3 higher = vec3(269.025) * pow(rgb, vec3(1.0 / 2.4)) - vec3(14.025);
-  return mix(higher, lower, vec3(cutoff));
-}
-
-vec4 srgba_from_linear(vec4 rgba) {
-  return vec4(srgb_from_linear(rgba.rgb), 255.0 * rgba.a);
-}
-
-// 0-1 linear  from  0-255 sRGB
-vec3 linear_from_srgb(vec3 srgb) {
-    bvec3 cutoff = lessThan(srgb, vec3(10.31475));
-    vec3 lower = srgb / vec3(3294.6);
-    vec3 higher = pow((srgb + vec3(14.025)) / vec3(269.025), vec3(2.4));
-    return mix(higher, lower, cutoff);
-}
-
-vec4 linear_from_srgba(vec4 srgba) {
-    return vec4(linear_from_srgb(srgba.rgb * 255.0), srgba.a);
-}
-
-void main() {
-    vec4 texture_color = texture(font_texture, v_tex_coords);
-
-    if (push_constants.need_srgb_conv == 0) {
-        f_color = v_color * texture_color;
-    } else {
-        f_color = srgba_from_linear(v_color * texture_color) / 255.0;
-        f_color.a = pow(f_color.a, 1.6);
-    }
-}"
     }
 }
