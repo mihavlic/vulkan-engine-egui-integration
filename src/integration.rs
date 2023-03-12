@@ -10,64 +10,78 @@ use std::sync::Arc;
 
 use egui::{ClippedPrimitive, TexturesDelta};
 use egui_winit::winit::event_loop::EventLoopWindowTarget;
-use pumice::{
-    command_buffer::SecondaryAutoCommandBuffer,
-    device::Queue,
-    format::{Format, NumericType},
-    image::{ImageViewAbstract, SampleCount},
-    render_pass::Subpass,
-    swapchain::Surface,
-    sync::GpuFuture,
+use graph::{
+    device::{submission, Device},
+    object,
 };
-use winit::window::Window;
+use pumice::vk;
 
-use crate::{
-    renderer::{RenderResources, Renderer},
-    utils::{immutable_texture_from_bytes, immutable_texture_from_file},
-};
+use crate::renderer;
 
-fn get_surface_image_format(
-    surface: &Arc<Surface>,
-    preferred_format: Option<Format>,
-    gfx_queue: &Arc<Queue>,
-) -> pumice::format::Format {
-    preferred_format.unwrap_or_else(|| {
-        gfx_queue
-            .device()
-            .physical_device()
-            .surface_formats(surface, Default::default())
-            .unwrap()
-            .iter()
-            .find(|f| f.0.type_color().unwrap() == NumericType::SRGB)
-            .unwrap()
-            .0
-    })
+unsafe fn get_surface_image_format(
+    surface: &object::Surface,
+    preferred_format: Option<vk::Format>,
+    device: &Device,
+) -> vk::Format {
+    let instance = &device.instance();
+    let (formats, result) = instance
+        .handle()
+        .get_physical_device_surface_formats_khr(device.physical_device(), surface.handle(), None)
+        .unwrap();
+
+    assert_eq!(result, vk::Result::SUCCESS);
+
+    let format_order = &[
+        preferred_format.unwrap_or(vk::Format::UNDEFINED),
+        vk::Format::R8G8B8A8_SRGB,
+        vk::Format::B8G8R8A8_SRGB,
+        vk::Format::R8G8B8A8_UNORM,
+        vk::Format::B8G8R8A8_UNORM,
+        vk::Format::A2B10G10R10_UNORM_PACK32,
+        vk::Format::R32G32B32A32_SFLOAT,
+    ];
+
+    for &format in format_order {
+        if format == vk::Format::UNDEFINED {
+            continue;
+        }
+
+        if formats.contains(&format) {
+            return format;
+        }
+    }
+
+    panic!("Couldn't select format")
 }
 
 pub struct GuiConfig {
     /// Preferred target image format. This should match the surface format. Sometimes the user
     /// may prefer linear color space rather than non linear. Hence the option. SRGB is selected by
     /// default.
-    pub preferred_format: Option<Format>,
+    pub preferred_format: Option<vk::Format>,
     /// Whether to render gui as overlay. Only relevant in the case of `Gui::new`, not when using
     /// subpass. Determines whether the pipeline should clear the target image.
     pub is_overlay: bool,
     /// Multisample count. Defaults to 1. If you use more than 1, you'll have to ensure your
     /// pipeline and target image matches that.
-    pub samples: SampleCount,
+    pub samples: vk::SampleCountFlags,
 }
 
 impl Default for GuiConfig {
     fn default() -> Self {
-        GuiConfig { preferred_format: None, is_overlay: false, samples: SampleCount::Sample1 }
+        GuiConfig {
+            preferred_format: None,
+            is_overlay: false,
+            samples: vk::SampleCountFlags::C1,
+        }
     }
 }
 
 pub struct Gui {
     pub egui_ctx: egui::Context,
     pub egui_winit: egui_winit::State,
-    renderer: Renderer,
-    surface: Arc<Surface>,
+    renderer: renderer::Renderer,
+    surface: object::Surface,
 
     shapes: Vec<egui::epaint::ClippedShape>,
     textures_delta: egui::TexturesDelta,
@@ -86,8 +100,11 @@ impl Gui {
     ) -> Gui {
         // Pick preferred format if provided, otherwise use the default one
         let format = get_surface_image_format(&surface, config.preferred_format, &gfx_queue);
-        let max_texture_side =
-            gfx_queue.device().physical_device().properties().max_image_array_layers as usize;
+        let max_texture_side = gfx_queue
+            .device()
+            .physical_device()
+            .properties()
+            .max_image_array_layers as usize;
         let renderer =
             Renderer::new_with_render_pass(gfx_queue, format, config.is_overlay, config.samples);
         let mut egui_winit = egui_winit::State::new(event_loop);
@@ -113,8 +130,11 @@ impl Gui {
     ) -> Gui {
         // Pick preferred format if provided, otherwise use the default one
         let format = get_surface_image_format(&surface, config.preferred_format, &gfx_queue);
-        let max_texture_side =
-            gfx_queue.device().physical_device().properties().max_image_array_layers as usize;
+        let max_texture_side = gfx_queue
+            .device()
+            .physical_device()
+            .properties()
+            .max_image_array_layers as usize;
         let renderer = Renderer::new_with_subpass(gfx_queue, format, subpass);
         let mut egui_winit = egui_winit::State::new(event_loop);
         egui_winit.set_max_texture_side(max_texture_side);
@@ -143,21 +163,16 @@ impl Gui {
     ///
     /// Note that egui uses `tab` to move focus between elements, so this will always return `true` for tabs.
     pub fn update(&mut self, winit_event: &winit::event::WindowEvent<'_>) -> bool {
-        self.egui_winit.on_event(&self.egui_ctx, winit_event).consumed
+        self.egui_winit
+            .on_event(&self.egui_ctx, winit_event)
+            .consumed
     }
 
     /// Begins Egui frame & determines what will be drawn later. This must be called before draw, and after `update` (winit event).
-    pub fn immediate_ui(&mut self, layout_function: impl FnOnce(&mut Self)) {
-        let raw_input = self.egui_winit.take_egui_input(surface_window(&self.surface));
-        self.egui_ctx.begin_frame(raw_input);
-        // Render Egui
-        layout_function(self);
-    }
-
-    /// If you wish to better control when to begin frame, do so by calling this function
-    /// (Finish by drawing)
     pub fn begin_frame(&mut self) {
-        let raw_input = self.egui_winit.take_egui_input(surface_window(&self.surface));
+        let raw_input = self
+            .egui_winit
+            .take_egui_input(surface_window(&self.surface));
         self.egui_ctx.begin_frame(raw_input);
     }
 
@@ -224,8 +239,12 @@ impl Gui {
     }
 
     fn end_frame(&mut self) {
-        let egui::FullOutput { platform_output, repaint_after: _r, textures_delta, shapes } =
-            self.egui_ctx.end_frame();
+        let egui::FullOutput {
+            platform_output,
+            repaint_after: _r,
+            textures_delta,
+            shapes,
+        } = self.egui_ctx.end_frame();
 
         self.egui_winit.handle_platform_output(
             surface_window(&self.surface),
@@ -252,7 +271,7 @@ impl Gui {
         image_file_bytes: &[u8],
         format: pumice::format::Format,
     ) -> egui::TextureId {
-        let image = immutable_texture_from_file(
+        let image = immutable_texture_from_compressed(
             self.renderer.allocators(),
             self.renderer.queue(),
             image_file_bytes,
