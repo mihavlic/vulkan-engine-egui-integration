@@ -26,7 +26,9 @@ graph = {git = "https://github.com/mihavlic/vulkan-engine.git"}
 
 ahash = "0.8.1"
 bytemuck = "1.12.2"
+slice-group-by = "0.3.0"
+
 egui = "0.20.1"
 egui-winit = "0.20.1"
-image = "0.24.4"
 winit = "0.27.5"
+image = "0.24.4"

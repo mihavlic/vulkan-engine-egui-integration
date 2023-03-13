@@ -9,6 +9,7 @@ use graph::{
 };
 use pumice::{util::ObjectHandle, vk};
 use pumice_vma as vma;
+use slice_group_by::GroupBy;
 use std::{collections::HashMap, ffi::c_void};
 
 const VERTEX_BUFFER_COUNT: usize = 1024 * 1024 * 4;
@@ -387,42 +388,48 @@ impl Renderer {
             })
             .get_handle()
     }
-
+    unsafe fn create_image([width, height]: [u32; 2], device: &Device) -> TextureImage {}
     unsafe fn update_texture(
         &mut self,
         texture_id: egui::TextureId,
-        delta: &egui::epaint::ImageDelta,
+        deltas: impl Iterator<Item = egui::epaint::ImageDelta>,
         device: &Device,
     ) {
-        let data = match &delta.image {
-            egui::ImageData::Color(image) => {
-                assert_eq!(
-                    image.width() * image.height(),
-                    image.pixels.len(),
-                    "Mismatch between texture size and texel count"
-                );
+        let srgb_data = deltas
+            .map(|delta| match &delta.image {
+                egui::ImageData::Color(image) => {
+                    assert_eq!(
+                        image.width() * image.height(),
+                        image.pixels.len(),
+                        "Mismatch between texture size and texel count"
+                    );
 
-                let slice = unsafe {
-                    // Color32 is repr(C) [u8; 4]
-                    // this makes it castable as a &[u8]
-                    std::slice::from_raw_parts(
-                        image.pixels.as_ptr().cast::<u8>(),
-                        image.width() * image.height() * 4,
-                    )
-                };
+                    let slice = unsafe {
+                        // Color32 is repr(C) [u8; 4]
+                        // this makes it castable as a &[u8]
+                        std::slice::from_raw_parts(
+                            image.pixels.as_ptr().cast::<u8>(),
+                            image.width() * image.height() * 4,
+                        )
+                    };
 
-                slice.to_vec()
-            }
-            egui::ImageData::Font(image) => {
-                // hope that the codegen is decent
-                image
-                    .srgba_pixels(None)
-                    .flat_map(|c| c.to_array())
-                    .collect()
-            }
-        };
+                    slice.to_vec()
+                }
+                egui::ImageData::Font(image) => {
+                    // hope that the codegen is decent
+                    image
+                        .srgba_pixels(None)
+                        .flat_map(|c| c.to_array())
+                        .collect()
+                }
+            })
+            .collect::<Vec<_>>();
 
-        let image = self.texture_images.get_mut(&texture_id).unwrap();
+        let image = self
+            .texture_images
+            .entry(texture_id)
+            .or_insert_with(default);
+
         let offset = delta
             .pos
             .map(|[x, y]| vk::Offset3D {
@@ -487,7 +494,7 @@ impl Renderer {
         resolve_view_formats: &[vk::Format],
 
         clear: Option<vk::ClearColorValue>,
-        scale_factor: f32,
+        pixels_per_point: f32,
 
         clipped_meshes: &[egui::ClippedPrimitive],
         textures_delta: &TexturesDelta,
@@ -511,7 +518,10 @@ impl Renderer {
         self.pending_retired_textures
             .extend(textures_delta.free.iter().copied());
 
-        for (id, image_delta) in textures_delta.set.iter() {
+        let mut texture_deltas: Vec<_> = textures_delta.set.iter().cloned().collect();
+        texture_deltas.sort_by_key(|d| d.0);
+
+        for deltas in texture_deltas.binary_group_by_key(|d| d.0) {
             self.update_texture(*id, &image_delta, device);
         }
 
@@ -621,8 +631,8 @@ impl Renderer {
                     max_depth: 1.0,
                 }],
             );
-            let width_points = width as f32 / scale_factor as f32;
-            let height_points = height as f32 / scale_factor as f32;
+            let width_in_points = width as f32 / pixels_per_point;
+            let height_in_points = height as f32 / pixels_per_point;
             d.cmd_push_constants(
                 command_buffer,
                 pipeline_layout.get_handle(),
@@ -630,7 +640,7 @@ impl Renderer {
                 0,
                 std::mem::size_of::<PushConstants>() as u32,
                 &PushConstants {
-                    screen_size: [width_points, height_points],
+                    screen_size: [width_in_points, height_in_points],
                     need_srgb_conv: self.need_srgb_conv as i32,
                 } as *const _ as *const c_void,
             );
@@ -692,35 +702,35 @@ impl Renderer {
             vertex_buffer_ptr.copy_from_nonoverlapping(mesh.vertices.as_ptr(), mesh.vertices.len());
             index_buffer_ptr.copy_from_nonoverlapping(mesh.indices.as_ptr(), mesh.indices.len());
 
-            let min = clip_rect.min;
-            let min = egui::Pos2 {
-                x: min.x * scale_factor,
-                y: min.y * scale_factor,
-            };
-            let min = egui::Pos2 {
-                x: f32::clamp(min.x, 0.0, width as f32),
-                y: f32::clamp(min.y, 0.0, height as f32),
-            };
-            let max = clip_rect.max;
-            let max = egui::Pos2 {
-                x: max.x * scale_factor,
-                y: max.y * scale_factor,
-            };
-            let max = egui::Pos2 {
-                x: f32::clamp(max.x, min.x, width as f32),
-                y: f32::clamp(max.y, min.y, height as f32),
-            };
+            // Transform clip rect to physical pixels:
+            let clip_min_x = pixels_per_point * clip_rect.min.x;
+            let clip_min_y = pixels_per_point * clip_rect.min.y;
+            let clip_max_x = pixels_per_point * clip_rect.max.x;
+            let clip_max_y = pixels_per_point * clip_rect.max.y;
+
+            // Round to integer:
+            let clip_min_x = clip_min_x.round() as i32;
+            let clip_min_y = clip_min_y.round() as i32;
+            let clip_max_x = clip_max_x.round() as i32;
+            let clip_max_y = clip_max_y.round() as i32;
+
+            // Clamp:
+            let clip_min_x = clip_min_x.clamp(0, width as i32);
+            let clip_min_y = clip_min_y.clamp(0, height as i32);
+            let clip_max_x = clip_max_x.clamp(clip_min_x, width as i32);
+            let clip_max_y = clip_max_y.clamp(clip_min_y, height as i32);
+
             d.cmd_set_scissor(
                 command_buffer,
                 0,
                 &[vk::Rect2D {
                     offset: vk::Offset2D {
-                        x: min.x.round() as i32,
-                        y: min.y.round() as i32,
+                        x: clip_min_x,
+                        y: clip_min_y,
                     },
                     extent: vk::Extent2D {
-                        width: (max.x.round() - min.x) as u32,
-                        height: (max.y.round() - min.y) as u32,
+                        width: (clip_min_x - clip_max_x) as u32,
+                        height: (clip_min_y - clip_max_y) as u32,
                     },
                 }],
             );
