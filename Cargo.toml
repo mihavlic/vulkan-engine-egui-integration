@@ -11,11 +11,6 @@ repository = "https://github.com/hakolao/egui_winit_vulkano"
 categories = ["gui", "game-development"]
 keywords = ["gui", "imgui", "immediate", "portable", "gamedev"]
 
-[features]
-default = ["clipboard", "links"]
-links = ["egui-winit/links"]
-clipboard = ["egui-winit/clipboard"]
-
 [patch.'https://github.com/mihavlic/vulkan-engine']
 graph = { path = "../vulkan-engine" }
 
@@ -32,3 +27,8 @@ egui = "0.20.1"
 egui-winit = "0.20.1"
 winit = "0.27.5"
 image = "0.24.4"
+
+[features]
+default = ["clipboard", "links"]
+links = ["egui-winit/links"]
+clipboard = ["egui-winit/clipboard"]

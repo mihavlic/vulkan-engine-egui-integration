@@ -1,7 +1,12 @@
 use crate::utils::EguiDescriptorSetAllocator;
 use egui::{Color32, TexturesDelta};
 use graph::{
-    device::{staging::ImageWrite, submission, Device},
+    device::{
+        batch::GenerationId,
+        staging::ImageWrite,
+        submission::{self, QueueSubmission},
+        Device,
+    },
     object,
     smallvec::smallvec,
     storage::DefaultAhashRandomstate,
@@ -10,7 +15,13 @@ use graph::{
 use pumice::{util::ObjectHandle, vk};
 use pumice_vma as vma;
 use slice_group_by::GroupBy;
-use std::{collections::HashMap, ffi::c_void};
+use std::{
+    collections::{
+        hash_map::{Entry, VacantEntry},
+        HashMap,
+    },
+    ffi::c_void,
+};
 
 const VERTEX_BUFFER_COUNT: usize = 1024 * 1024 * 4;
 const INDEX_BUFFER_COUNT: usize = 1024 * 1024 * 2;
@@ -22,7 +33,6 @@ const INDEX_BUFFER_BYTES: u64 = (INDEX_BUFFER_COUNT * 4) as u64;
 #[repr(C)]
 pub struct PushConstants {
     screen_size: [f32; 2],
-    need_srgb_conv: i32,
 }
 
 struct TextureImage {
@@ -37,7 +47,6 @@ enum RendererEvent {
 }
 
 pub struct Renderer {
-    need_srgb_conv: bool,
     resolve_attachment: bool,
 
     queue: submission::Queue,
@@ -64,7 +73,7 @@ pub struct Renderer {
 impl Renderer {
     pub unsafe fn new_with_render_pass(
         queue: submission::Queue,
-        format_is_srgb: bool,
+        output_attachment_is_unorm_nonlinear: bool,
         format: vk::Format,
 
         samples: vk::SampleCountFlags,
@@ -196,12 +205,35 @@ impl Renderer {
                 .create_pipeline_layout(object::PipelineLayoutCreateInfo {
                     set_layouts: vec![set_layout.clone()],
                     push_constants: vec![vk::PushConstantRange {
-                        stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        stage_flags: vk::ShaderStageFlags::VERTEX,
                         offset: 0,
                         size: std::mem::size_of::<PushConstants>() as u32,
                     }],
                 })
                 .unwrap();
+
+            let specialization = {
+                let srgb_textures = false;
+                let output_srgb_fragment = output_attachment_is_unorm_nonlinear;
+                let data = [srgb_textures as u32, output_srgb_fragment as u32];
+                let bytes = std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), 8);
+
+                object::SpecializationInfo {
+                    map_entries: vec![
+                        vk::SpecializationMapEntry {
+                            constant_id: 0,
+                            offset: 0,
+                            size: 4,
+                        },
+                        vk::SpecializationMapEntry {
+                            constant_id: 1,
+                            offset: 4,
+                            size: 4,
+                        },
+                    ],
+                    data: bytes.to_vec(),
+                }
+            };
 
             let info = object::GraphicsPipelineCreateInfo::builder()
                 .stages([
@@ -217,7 +249,7 @@ impl Renderer {
                         stage: vk::ShaderStageFlags::FRAGMENT,
                         module: fs,
                         name: "main".into(),
-                        specialization_info: None,
+                        specialization_info: Some(specialization),
                     },
                 ])
                 .input_assembly(object::state::InputAssembly {
@@ -293,7 +325,6 @@ impl Renderer {
             (device.create_graphics_pipeline(info).unwrap(), set_layout)
         };
 
-        let need_srgb_conv = !format_is_srgb;
         let vertex_buffer = Self::create_buffer(
             VERTEX_BUFFER_BYTES,
             vk::BufferUsageFlags::VERTEX_BUFFER,
@@ -307,7 +338,6 @@ impl Renderer {
         );
 
         Renderer {
-            need_srgb_conv,
             resolve_attachment: resolve_enable,
             queue,
             render_pass,
@@ -363,7 +393,8 @@ impl Renderer {
     }
 
     unsafe fn get_sampler(
-        samplers: &mut HashMap<egui::TextureOptions, object::Sampler, DefaultAhashRandomstate>,
+        &mut self,
+        // samplers: &mut HashMap<egui::TextureOptions, object::Sampler, DefaultAhashRandomstate>,
         options: egui::TextureOptions,
         device: &Device,
     ) -> vk::Sampler {
@@ -372,7 +403,7 @@ impl Renderer {
             egui::TextureFilter::Linear => vk::Filter::LINEAR,
         };
 
-        samplers
+        self.samplers
             .entry(options)
             .or_insert_with(|| {
                 device
@@ -388,42 +419,188 @@ impl Renderer {
             })
             .get_handle()
     }
-    unsafe fn create_image([width, height]: [u32; 2], device: &Device) -> TextureImage {}
-    unsafe fn update_texture(
+    // unsafe fn create_image([width, height]: [u32; 2], device: &Device) -> TextureImage {}
+    unsafe fn update_textures(
         &mut self,
-        texture_id: egui::TextureId,
-        deltas: impl Iterator<Item = egui::epaint::ImageDelta>,
+        delta: &TexturesDelta,
         device: &Device,
-    ) {
-        let srgb_data = deltas
-            .map(|delta| match &delta.image {
-                egui::ImageData::Color(image) => {
-                    assert_eq!(
-                        image.width() * image.height(),
-                        image.pixels.len(),
-                        "Mismatch between texture size and texel count"
-                    );
+    ) -> Option<QueueSubmission> {
+        for tex in self.pending_retired_textures.drain(..) {
+            let entry = self.texture_images.remove(&tex).unwrap();
+            self.set_allocator.free_set(entry.set);
+        }
 
-                    let slice = unsafe {
-                        // Color32 is repr(C) [u8; 4]
-                        // this makes it castable as a &[u8]
-                        std::slice::from_raw_parts(
-                            image.pixels.as_ptr().cast::<u8>(),
-                            image.width() * image.height() * 4,
-                        )
+        self.pending_retired_textures
+            .extend(delta.free.iter().copied());
+
+        let mut texture_deltas: Vec<_> = delta.set.iter().cloned().collect();
+        texture_deltas.sort_by_key(|d| d.0);
+
+        let mut transfers = Vec::new();
+
+        for image_blits in texture_deltas.binary_group_by_key(|d| d.0) {
+            let mut regions = Vec::new();
+            let mut datas = Vec::new();
+            let texture_id = image_blits[0].0;
+
+            for (_, blit) in image_blits {
+                let width = blit.image.width() as u32;
+                let height = blit.image.height() as u32;
+
+                if width == 0 || height == 0 {
+                    continue;
+                }
+
+                let data = match &blit.image {
+                    egui::ImageData::Color(image) => {
+                        assert_eq!(
+                            width as usize * height as usize,
+                            image.pixels.len(),
+                            "Mismatch between texture size and texel count"
+                        );
+
+                        let slice = unsafe {
+                            // Color32 is repr(C) [u8; 4]
+                            // this makes it castable as a &[u8]
+                            std::slice::from_raw_parts(
+                                image.pixels.as_ptr().cast::<u8>(),
+                                image.width() * image.height() * 4,
+                            )
+                        };
+
+                        slice.to_vec()
+                    }
+                    egui::ImageData::Font(image) => {
+                        // hope that the codegen is decent
+                        image
+                            .srgba_pixels(None)
+                            .flat_map(|c| c.to_array())
+                            .collect()
+                    }
+                };
+                datas.push(data);
+
+                let entry = self.texture_images.entry(texture_id);
+
+                // this means that a new image is to be created with the size of this delta
+                if let Some(pos) = blit.pos {
+                    let Entry::Vacant(v) = entry else {
+                        // FIXME should this be supported?
+                        panic!("Creating new image for an already occupied handle");
                     };
 
-                    slice.to_vec()
+                    let (character, index) = match texture_id {
+                        egui::TextureId::Managed(i) => ('M', i),
+                        egui::TextureId::User(i) => ('U', i),
+                    };
+
+                    let image = device
+                        .create_image(
+                            object::ImageCreateInfo {
+                                flags: vk::ImageCreateFlags::empty(),
+                                size: object::Extent::D2(width, height),
+                                // we explicitly want a UNORM format
+                                // because we want the fragment shader to not
+                                // convert our colors to linear space
+                                format: vk::Format::R8G8B8A8_UNORM,
+                                samples: vk::SampleCountFlags::C1,
+                                mip_levels: 1,
+                                array_layers: 1,
+                                tiling: vk::ImageTiling::OPTIMAL,
+                                usage: vk::ImageUsageFlags::SAMPLED,
+                                sharing_mode_concurrent: false,
+                                initial_layout: vk::ImageLayout::UNDEFINED,
+                                label: Some(format!("egui tex {character}#{index}").into()),
+                            },
+                            vma::AllocationCreateInfo {
+                                flags: vma::AllocationCreateFlags::empty(),
+                                preferred_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                                usage: vma::MemoryUsage::AutoPreferDevice,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+
+                    let sampler = self.get_sampler(blit.options, device);
+                    let view = image
+                        .get_view(
+                            &object::ImageViewCreateInfo {
+                                view_type: vk::ImageViewType::T2D,
+                                format: vk::Format::R8G8B8A8_UNORM,
+                                components: vk::ComponentMapping::default(),
+                                subresource_range: image.get_whole_subresource_range(),
+                            },
+                            GenerationId::NEVER,
+                        )
+                        .unwrap();
+                    let set = self
+                        .set_allocator
+                        .allocate(view, sampler, &self.desc_layout, device);
+
+                    let texture = TextureImage {
+                        image,
+                        set,
+                        view,
+                        options: blit.options,
+                    };
+
+                    v.insert(texture);
+                } else {
+                    let Entry::Occupied(v) = entry else {
+                        panic!("Updating a not yet initialized image");
+                    };
+                    let texture = v.get();
+
+                    if texture.options != blit.options {
+                        let sampler = self.get_sampler(blit.options, device);
+                        let new_set = self.set_allocator.allocate(
+                            texture.view,
+                            sampler,
+                            &self.desc_layout,
+                            device,
+                        );
+
+                        self.pending_retired_sets.push(texture.set);
+                        texture.options = blit.options;
+                        texture.set = new_set;
+                    }
                 }
-                egui::ImageData::Font(image) => {
-                    // hope that the codegen is decent
-                    image
-                        .srgba_pixels(None)
-                        .flat_map(|c| c.to_array())
-                        .collect()
-                }
-            })
-            .collect::<Vec<_>>();
+
+                let image_offset = blit
+                    .pos
+                    .map(|[w, h]| vk::Offset3D {
+                        x: w as i32,
+                        y: h as i32,
+                        z: 0,
+                    })
+                    .unwrap_or_default();
+
+                let image_extent = vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                };
+
+                regions.push(ImageWrite {
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset,
+                    image_extent,
+                });
+            }
+
+            transfers.push(graph::device::staging::WriteCommand::Image {})
+        }
+
+        // let srgb_data = deltas
+        //     .map(|delta| )
+        //     .collect::<Vec<_>>();
 
         let image = self
             .texture_images
@@ -465,17 +642,6 @@ impl Renderer {
                 ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
             },
         );
-
-        if image.options != delta.options {
-            image.options = delta.options;
-            let sampler = Self::get_sampler(&mut self.samplers, delta.options, device);
-            let new_set =
-                self.set_allocator
-                    .allocate(image.view, sampler, &self.desc_layout, device);
-
-            self.pending_retired_sets.push(image.set);
-            image.set = new_set;
-        }
     }
 
     /// Record paint commands.
@@ -510,20 +676,7 @@ impl Renderer {
             self.set_allocator.free_set(set);
         }
 
-        for tex in self.pending_retired_textures.drain(..) {
-            let entry = self.texture_images.remove(&tex).unwrap();
-            self.set_allocator.free_set(entry.set);
-        }
-
-        self.pending_retired_textures
-            .extend(textures_delta.free.iter().copied());
-
-        let mut texture_deltas: Vec<_> = textures_delta.set.iter().cloned().collect();
-        texture_deltas.sort_by_key(|d| d.0);
-
-        for deltas in texture_deltas.binary_group_by_key(|d| d.0) {
-            self.update_texture(*id, &image_delta, device);
-        }
+        self.update_textures(textures_delta, device);
 
         let framebuffer_size_differs = || {
             let info = self.framebuffer.as_ref().unwrap().get_create_info();
